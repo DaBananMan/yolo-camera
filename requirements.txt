@@ -1,0 +1,15 @@
+
+streamlit
+# Use a flexible ultralytics spec so pip can select a version compatible with your Python
+ultralytics>=8.0
+# Use the headless OpenCV build on servers (no GUI dependencies)
+opencv-python-headless
+# Pin a reasonably recent numpy version to avoid build issues
+numpy>=1.23
+# Add torch and torchvision for CPU-only environments. If you have a CUDA-enabled
+# environment, replace these pins with the appropriate CUDA builds as needed.
+torch>=1.13.0
+torchvision>=0.14.0
+# Optional: albumentations and joblib used by the DrownDetect fallback
+albumentations
+joblib
