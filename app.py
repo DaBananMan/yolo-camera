@@ -7,6 +7,8 @@ from pathlib import Path
 import streamlit as st
 import math
 import numpy as np
+import firebase_admin
+from firebase_admin import credentials, db
 # Import ultralytics only when needed (inside load_model) to avoid import-time
 # failures in environments where torch is not yet installed. This prevents the
 # Streamlit process from exiting immediately inside a Docker container while
@@ -97,6 +99,13 @@ TAPO_STREAM_URL = 'rtsp://AquaGuard:AQGuardCam@192.168.68.53:554/stream1'
 LIGHT_MODE = os.environ.get('STREAMLIT_LIGHT_MODE', '0') in ('1', 'true', 'True')
 
 
+if not firebase_admin._apps:
+    cred = credentials.Certificate("serviceAccountKey.json")
+
+    firebase_admin.initialize_app(cred, {
+        "databaseURL": "https://YOUR-PROJECT-ID-default-rtdb.firebaseio.com/"
+    })
+
 @st.cache_resource
 def load_model(model_path: str = None):
     if LIGHT_MODE:
@@ -186,6 +195,109 @@ def process_video(model, input_path, output_path, conf=0.4, frame_skip=1):
     out.release()
     elapsed = time.time() - start
     return processed, elapsed
+
+
+ALERT_NODE = "alert"
+ALERT_GUEST_NAME = "Found at Pool 1"
+ALERT_MAJOR_AFTER_SECONDS = 10
+ALERT_MATCH_DISTANCE = 80
+
+
+def get_next_alert_id():
+    """Return the next sequential alert ID based on the current table contents."""
+    try:
+        snapshot = db.reference(ALERT_NODE).get()
+    except Exception:
+        return 1
+
+    max_alert_id = 0
+    if isinstance(snapshot, dict):
+        for key, value in snapshot.items():
+            candidate = None
+            if isinstance(value, dict) and value.get("lastAlertID") is not None:
+                candidate = value.get("lastAlertID")
+            else:
+                candidate = key
+
+            try:
+                max_alert_id = max(max_alert_id, int(candidate))
+            except Exception:
+                continue
+
+    return max_alert_id + 1
+
+
+def send_camera_alert(alert_level, confidence):
+    alert_id = get_next_alert_id()
+    timestamp = int(time.time())
+    payload = {
+        "lastAlertID": alert_id,
+        "alertLevel": alert_level,
+        "cause": f"Camera confidence: {round(confidence, 2)}",
+        "guestName": ALERT_GUEST_NAME,
+        "confidence": round(confidence, 2),
+        "timestamp": timestamp,
+        "timestampIso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(timestamp)),
+    }
+    db.reference(ALERT_NODE).child(str(alert_id)).set(payload)
+    return alert_id
+
+
+def match_detection_to_track(rect, tracked_objects, max_distance=ALERT_MATCH_DISTANCE):
+    if not tracked_objects:
+        return None
+
+    x1, y1, x2, y2 = rect
+    centroid_x = int((x1 + x2) / 2.0)
+    centroid_y = int((y1 + y2) / 2.0)
+
+    best_object_id = None
+    best_distance = None
+    for object_id, centroid in tracked_objects.items():
+        distance = math.hypot(centroid[0] - centroid_x, centroid[1] - centroid_y)
+        if best_distance is None or distance < best_distance:
+            best_distance = distance
+            best_object_id = object_id
+
+    if best_distance is not None and best_distance <= max_distance:
+        return best_object_id
+
+    return f"{centroid_x}:{centroid_y}"
+
+
+def update_drowning_alert_state(drown_detections, tracked_objects):
+    now = time.time()
+    alert_state = st.session_state.setdefault("drown_alert_state", {})
+
+    for detection in drown_detections:
+        track_key = str(match_detection_to_track(detection["rect"], tracked_objects))
+        state = alert_state.get(track_key)
+        if state is None:
+            state = {
+                "first_seen": now,
+                "last_seen": now,
+                "minor_sent": False,
+                "major_sent": False,
+            }
+            alert_state[track_key] = state
+
+        state["last_seen"] = now
+        elapsed = now - state["first_seen"]
+
+        if not state["minor_sent"]:
+            send_camera_alert("Minor", detection["confidence"])
+            state["minor_sent"] = True
+
+        if elapsed >= ALERT_MAJOR_AFTER_SECONDS and not state["major_sent"]:
+            send_camera_alert("Major", detection["confidence"])
+            state["major_sent"] = True
+
+    stale_keys = [
+        key for key, state in alert_state.items()
+        if now - state.get("last_seen", now) > 20
+    ]
+    for key in stale_keys:
+        alert_state.pop(key, None)
 
 
 def stream_process_video(model, input_path, conf=0.4, frame_skip=1, placeholder=None):
@@ -355,6 +467,7 @@ def stream_process_video(model, input_path, conf=0.4, frame_skip=1, placeholder=
 
         # Draw boxes if present and collect rects for tracking
         rects = []
+        drown_detections = []
         if len(results) > 0:
             res = results[0]
             boxes = res.boxes
@@ -389,6 +502,11 @@ def stream_process_video(model, input_path, conf=0.4, frame_skip=1, placeholder=
                             if cls == 0:
                                 is_drown = True
 
+                        rects.append((x1, y1, x2, y2))
+
+                        if is_drown:
+                            drown_detections.append({"rect": (x1, y1, x2, y2), "confidence": confscore})
+
                         # Decide whether to draw based on toggles
                         show_blue = st.session_state.get('show_blue', True)
                         show_red = st.session_state.get('show_red', True)
@@ -397,17 +515,17 @@ def stream_process_video(model, input_path, conf=0.4, frame_skip=1, placeholder=
                             label = f"drowning:{confscore:.2f}"
                             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
                             cv2.putText(frame, label, (x1, max(y1-6,0)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-                            rects.append((x1, y1, x2, y2))
                         elif not is_drown and show_blue:
                             color = (255, 0, 0)
                             label = f"safe:{confscore:.2f}"
                             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
                             cv2.putText(frame, label, (x1, max(y1-6,0)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-                            rects.append((x1, y1, x2, y2))
                     except Exception:
                         continue
 
         objects = tracker.update(rects)
+        if drown_detections:
+            update_drowning_alert_state(drown_detections, objects)
         # Do not draw tracker IDs on the UI; only red bounding boxes are shown
 
         # Encode the original BGR frame as JPEG bytes for a stable UI update.
@@ -503,6 +621,7 @@ def process_one_frame_and_continue(model, input_path):
     results = model.predict(frame, conf=current_conf, verbose=False)
 
     rects = []
+    drown_detections = []
     if len(results) > 0:
         res = results[0]
         boxes = res.boxes
@@ -536,23 +655,29 @@ def process_one_frame_and_continue(model, input_path):
                         if cls == 0:
                             is_drown = True
 
+                    rects.append((x1, y1, x2, y2))
+
                     # Respect show toggles from sidebar
                     show_blue = st.session_state.get('show_blue', True)
                     show_red = st.session_state.get('show_red', True)
+                    if is_drown:
+                        drown_detections.append({"rect": (x1, y1, x2, y2), "confidence": confscore})
+
                     if is_drown and show_red:
                         color = (0, 0, 255)  # red
                         label = f"drowning:{confscore:.2f}"
                         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
                         cv2.putText(frame, label, (x1, max(y1-6,0)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-                        rects.append((x1, y1, x2, y2))
                     elif not is_drown and show_blue:
                         color = (255, 0, 0)  # blue (BGR)
                         label = f"safe:{confscore:.2f}"
                         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
                         cv2.putText(frame, label, (x1, max(y1-6,0)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-                        rects.append((x1, y1, x2, y2))
                 except Exception:
                     continue
+
+    if drown_detections:
+        update_drowning_alert_state(drown_detections, {})
 
     # Convert and display
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
