@@ -1,5 +1,60 @@
 
+# Installation & Run Instructions
+# --------------------------------------------------
+# Quick overview: create a Python environment on the target device,
+# install the packages below into that environment, then run Streamlit
+# with the same Python interpreter.
+#
+# 1) Choose or install Python on the target device
+#    - Recommended: use Python 3.10+ (3.11 tested here). Install from
+#      the OS package manager or from python.org. Note the full path
+#      to the Python executable (example Windows: C:\Python311\python.exe).
+#
+# 2) Create and activate a virtual environment (recommended)
+#    - Windows (PowerShell):
+#      C:\Python311\python.exe -m venv .venv
+#      .\.venv\Scripts\Activate.ps1
+#    - Windows (cmd):
+#      C:\Python311\python.exe -m venv .venv
+#      .\.venv\Scripts\activate.bat
+#    - Linux/macOS:
+#      /usr/bin/python3 -m venv .venv
+#      source .venv/bin/activate
+#
+# 3) Install requirements into that environment (use the same python)
+#    - Install from this file:
+#      C:\Python311\python.exe -m pip install --upgrade pip
+#      C:\Python311\python.exe -m pip install -r requirements.txt
+#    - If you need a CUDA-enabled PyTorch, follow instructions from
+#      https://pytorch.org/ and install the matching `torch`/`torchvision`
+#      wheels *instead* of the CPU-only pins below. Example (Linux CUDA 11.7):
+#      pip install torch==1.13.1+cu117 torchvision==0.14.1+cu117 -f https://download.pytorch.org/whl/torch_stable.html
+#
+# 4) Run the app with the same Python interpreter that installed the packages
+#    - Use `python -m streamlit` to ensure Streamlit runs under the target interpreter:
+#      C:\Python311\python.exe -m streamlit run app.py
+#
+# 5) Environment variables and service account
+#    - Place your Firebase service account JSON in the project root named
+#      `SERVICE_ACCOUNT.json` or set `SERVICE_ACCOUNT_PATH` env var to its path.
+#    - Set `FIREBASE_DB_URL` in a `.env` file in the project root or export it
+#      as an environment variable before running the app.
+#
+# Platform notes
+#  - On headless servers (no GUI) `opencv-python-headless` is preferred (used below).
+#  - On Raspberry Pi / ARM devices, many wheels are not available; prefer CPU-only
+#    PyTorch builds or use lightweight models. You may need to compile from source.
+#  - Always run `python -m streamlit run app.py` from the same Python environment
+#    you used for `pip install` so the process sees the installed packages.
+#
+# Troubleshooting quick checks
+#  - Confirm Python path used by Streamlit inside the app: `sys.executable`.
+#  - If imports fail, activate the venv and run `python -c "import pkgutil; print(pkgutil.find_loader('firebase_admin'))"`.
+#
+# --------------------------------------------------
+
 streamlit
+firebase-admin
 # Use a flexible ultralytics spec so pip can select a version compatible with your Python
 ultralytics>=8.0
 # Use the headless OpenCV build on servers (no GUI dependencies)
