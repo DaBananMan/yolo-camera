@@ -7,8 +7,25 @@ from pathlib import Path
 import streamlit as st
 import math
 import numpy as np
-import firebase_admin
-from firebase_admin import credentials, db
+try:
+    from dotenv import load_dotenv
+    DOTENV_AVAILABLE = True
+except Exception:
+    # Provide a no-op fallback when python-dotenv isn't installed
+    def load_dotenv(*args, **kwargs):
+        return False
+    DOTENV_AVAILABLE = False
+import base64
+import sys
+
+try:
+    import firebase_admin
+    from firebase_admin import credentials, db
+except ImportError:
+    firebase_admin = None
+    credentials = None
+    db = None
+
 # Import ultralytics only when needed (inside load_model) to avoid import-time
 # failures in environments where torch is not yet installed. This prevents the
 # Streamlit process from exiting immediately inside a Docker container while
@@ -91,20 +108,116 @@ if HAS_TORCH:
             except Exception:
                 HAS_DROWN = False
 
-# Tapo live stream source.
-TAPO_STREAM_URL = 'rtsp://AquaGuard:AQGuardCam@192.168.68.53:554/stream1'
+# Load environment variables from project .env (if present)
+load_dotenv(str(BASE_DIR / '.env'))
+
+# Camera / stream URLs can be provided via .env
+TAPO_STREAM_URL = os.environ.get('TAPO_STREAM_URL', 'rtsp://AquaGuard:AQGuardCam@192.168.68.53:554/stream1')
+POOLCAM_PATH = Path(os.environ.get('POOLCAM_PATH', str(BASE_DIR / 'PoolCam.mp4')))
 
 # Light/demo mode: when STREAMLIT_LIGHT_MODE env var is set (or user chooses),
 # avoid heavy imports (torch/ultralytics) and play a local sample video or image.
 LIGHT_MODE = os.environ.get('STREAMLIT_LIGHT_MODE', '0') in ('1', 'true', 'True')
 
 
-if not firebase_admin._apps:
-    cred = credentials.Certificate("serviceAccountKey.json")
+# Firebase availability determined from env/service-account or default file
+SERVICE_ACCOUNT_PATH = os.environ.get('SERVICE_ACCOUNT_PATH')
+SERVICE_ACCOUNT_JSON_B64 = os.environ.get('SERVICE_ACCOUNT_JSON_B64')
+FIREBASE_DB_URL = os.environ.get('FIREBASE_DB_URL', 'https://aquaguard-db-default-rtdb.firebaseio.com/')
 
-    firebase_admin.initialize_app(cred, {
-        "databaseURL": "https://YOUR-PROJECT-ID-default-rtdb.firebaseio.com/"
-    })
+FIREBASE_AVAILABLE = (
+    firebase_admin is not None and
+    credentials is not None and
+    db is not None and
+    ( (SERVICE_ACCOUNT_PATH and Path(SERVICE_ACCOUNT_PATH).exists()) or bool(SERVICE_ACCOUNT_JSON_B64) or Path(BASE_DIR / "serviceAccountKey.json").exists() )
+)
+
+if FIREBASE_AVAILABLE and not firebase_admin._apps:
+    # select credential source: explicit path, embedded base64, or default file
+    cred_path = None
+    try:
+        if SERVICE_ACCOUNT_PATH and Path(SERVICE_ACCOUNT_PATH).exists():
+            cred_path = Path(SERVICE_ACCOUNT_PATH)
+        elif SERVICE_ACCOUNT_JSON_B64:
+            # decode to a temporary file
+            data = base64.b64decode(SERVICE_ACCOUNT_JSON_B64)
+            tf = tempfile.NamedTemporaryFile(delete=False, suffix='.json')
+            tf.write(data)
+            tf.flush()
+            cred_path = Path(tf.name)
+        else:
+            # check common filenames in the project root for a service account
+            candidates = [
+                Path(BASE_DIR / "SERVICE_ACCOUNT.json"),
+                Path(BASE_DIR / "serviceAccountKey.json"),
+                Path(BASE_DIR / "serviceAccount.json"),
+                Path(BASE_DIR / "service_account.json"),
+            ]
+            for c in candidates:
+                if c.exists():
+                    cred_path = c
+                    break
+
+        if cred_path is not None:
+            cred = credentials.Certificate(str(cred_path))
+            firebase_admin.initialize_app(cred, {
+                "databaseURL": FIREBASE_DB_URL
+            })
+        else:
+            st.session_state.setdefault('firebase_last_error', 'No service account available')
+    except Exception as e:
+        st.session_state.setdefault('firebase_last_error', f'init error: {e}')
+        st.session_state.setdefault('firebase_last_error_time', int(time.time()))
+
+if not FIREBASE_AVAILABLE:
+    st.session_state.setdefault("firebase_warning", "Firebase is not configured; alert uploads are disabled.")
+
+
+def ensure_firebase_initialized():
+    """Ensure firebase_admin is initialized in this process. Returns True if initialized."""
+    if firebase_admin is None or credentials is None or db is None:
+        st.session_state['firebase_last_error'] = 'firebase-admin package not available'
+        return False
+
+    if firebase_admin._apps:
+        return True
+
+    # try to initialize using available credentials (same logic as startup)
+    cred_path = None
+    try:
+        if SERVICE_ACCOUNT_PATH and Path(SERVICE_ACCOUNT_PATH).exists():
+            cred_path = Path(SERVICE_ACCOUNT_PATH)
+        elif SERVICE_ACCOUNT_JSON_B64:
+            data = base64.b64decode(SERVICE_ACCOUNT_JSON_B64)
+            tf = tempfile.NamedTemporaryFile(delete=False, suffix='.json')
+            tf.write(data)
+            tf.flush()
+            cred_path = Path(tf.name)
+        else:
+            candidates = [
+                Path(BASE_DIR / "SERVICE_ACCOUNT.json"),
+                Path(BASE_DIR / "serviceAccountKey.json"),
+                Path(BASE_DIR / "serviceAccount.json"),
+                Path(BASE_DIR / "service_account.json"),
+            ]
+            for c in candidates:
+                if c.exists():
+                    cred_path = c
+                    break
+
+        if cred_path is None:
+            st.session_state['firebase_last_error'] = 'No service account found for init'
+            return False
+
+        cred = credentials.Certificate(str(cred_path))
+        firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DB_URL})
+        st.session_state['firebase_connected'] = True
+        return True
+    except Exception as e:
+        st.session_state['firebase_last_error'] = f'init on-demand error: {e}'
+        st.session_state['firebase_last_error_time'] = int(time.time())
+        st.session_state['firebase_connected'] = False
+        return False
 
 @st.cache_resource
 def load_model(model_path: str = None):
@@ -197,14 +310,30 @@ def process_video(model, input_path, output_path, conf=0.4, frame_skip=1):
     return processed, elapsed
 
 
-ALERT_NODE = "alert"
+ALERT_NODE = "alerts"
 ALERT_GUEST_NAME = "Found at Pool 1"
 ALERT_MAJOR_AFTER_SECONDS = 10
 ALERT_MATCH_DISTANCE = 80
+ALERT_POLL_INTERVAL = 5  # seconds between polling Firebase for live updates
+ALERT_STATE_NODE = "alertState"
 
 
 def get_next_alert_id():
     """Return the next sequential alert ID based on the current table contents."""
+    # ensure firebase initialized in this process
+    ensure_firebase_initialized()
+    # Prefer an explicit `lastAlertID` entry in the database root for atomic next-id
+    try:
+        last = db.reference('lastAlertID').get()
+        if last is not None:
+            try:
+                return int(last) + 1
+            except Exception:
+                pass
+    except Exception:
+        # fall back to scanning ALERT_NODE children
+        pass
+
     try:
         snapshot = db.reference(ALERT_NODE).get()
     except Exception:
@@ -227,20 +356,145 @@ def get_next_alert_id():
     return max_alert_id + 1
 
 
+def allocate_alert_id_transactional():
+    """Atomically increment and return the next alert id using a Firebase transaction.
+    Falls back to `get_next_alert_id()` on error or if Firebase unavailable.
+    """
+    # Try to ensure firebase is initialized here
+    if not ensure_firebase_initialized():
+        return get_next_alert_id()
+    try:
+        ref = db.reference('lastAlertID')
+        def txn(current):
+            try:
+                cur = int(current) if current is not None else 0
+            except Exception:
+                cur = 0
+            return cur + 1
+
+        new_id = ref.transaction(txn)
+        return int(new_id)
+    except Exception as e:
+        st.session_state['firebase_last_error'] = f"transaction allocate id: {e}"
+        st.session_state['firebase_last_error_time'] = int(time.time())
+        return get_next_alert_id()
+
+
 def send_camera_alert(alert_level, confidence):
-    alert_id = get_next_alert_id()
+    # camera_number may be stored in session_state by the UI
+    camera_number = int(st.session_state.get('camera_number', 2))
+    guestname = f"Guest at Pool {camera_number}"
+
+    # Ensure Firebase initialized before attempting writes
+    ensure_firebase_initialized()
+
+    # Allocate alert id atomically against the shared `lastAlertID` key when possible
+    alert_id = allocate_alert_id_transactional()
     timestamp = int(time.time())
+    timestamp_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(timestamp))
+
+    # Minimal alert record stored under the alerts table
     payload = {
-        "lastAlertID": alert_id,
+        "alertID": alert_id,
         "alertLevel": alert_level,
         "cause": f"Camera confidence: {round(confidence, 2)}",
-        "guestName": ALERT_GUEST_NAME,
-        "confidence": round(confidence, 2),
-        "timestamp": timestamp,
-        "timestampIso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(timestamp)),
+        "guestName": guestname,
+        "readat": timestamp_iso,
     }
-    db.reference(ALERT_NODE).child(str(alert_id)).set(payload)
+
+    try:
+        db.reference(ALERT_NODE).child(str(alert_id)).set(payload)
+        st.session_state['firebase_last_write'] = int(time.time())
+        st.session_state['firebase_connected'] = True
+    except Exception as e:
+        # If Firebase not available, still record locally in session_state for UI
+        st.session_state['firebase_last_error'] = f"write alert: {e}"
+        st.session_state['firebase_last_error_time'] = int(time.time())
+        st.session_state['firebase_connected'] = False
+    try:
+        # update a dedicated lastAlertID key (summary node intentionally NOT written)
+        db.reference('lastAlertID').set(alert_id)
+        st.session_state['firebase_connected'] = True
+    except Exception as e:
+        st.session_state['firebase_last_error'] = f"write lastAlertID: {e}"
+        st.session_state['firebase_last_error_time'] = int(time.time())
+        st.session_state['firebase_connected'] = False
+    # Do NOT update any local counters; rely on Firebase as the source of truth.
+
     return alert_id
+
+
+def fetch_remote_alert_summary():
+    """Read summary info from Firebase: lastAlertID, lastAlert payload, minor/major counts."""
+    # Ensure firebase is initialized in this process (attempt on-demand)
+    if not ensure_firebase_initialized():
+        return None
+    try:
+        last_id = db.reference('lastAlertID').get()
+    except Exception as e:
+        last_id = None
+        st.session_state['firebase_last_error'] = f"fetch lastAlertID: {e}"
+        st.session_state['firebase_last_error_time'] = int(time.time())
+
+    minor = 0
+    major = 0
+    try:
+        snapshot = db.reference(ALERT_NODE).get()
+        if isinstance(snapshot, dict):
+            for v in snapshot.values():
+                if isinstance(v, dict):
+                    lvl = v.get('alertLevel') or v.get('alertlevel') or ''
+                    cause = (v.get('cause') or '')
+                    # Count only camera-originated alerts (cause mentioning 'camera')
+                    is_camera = isinstance(cause, str) and ('camera' in cause.lower())
+                    if not is_camera:
+                        continue
+                    if isinstance(lvl, str):
+                        if lvl.lower() == 'minor':
+                            minor += 1
+                        elif lvl.lower() == 'major':
+                            major += 1
+    except Exception as e:
+        st.session_state['firebase_last_error'] = f"scan alerts: {e}"
+        st.session_state['firebase_last_error_time'] = int(time.time())
+
+    # Also fetch the full last alert record from /alerts/<last_id> if present
+    last_alert = None
+    if last_id is not None:
+        try:
+            last_alert = db.reference(f"{ALERT_NODE}/{last_id}").get()
+        except Exception as e:
+            st.session_state['firebase_last_error'] = f"fetch last alert record: {e}"
+            st.session_state['firebase_last_error_time'] = int(time.time())
+
+    return {"lastAlertID": last_id, "lastAlert": last_alert, "minor": minor, "major": major}
+
+
+def get_remote_alert_state(track_key: str):
+    """Retrieve per-track alert state from Firebase. Returns dict or None."""
+    if not FIREBASE_AVAILABLE:
+        return None
+    try:
+        ref = db.reference(f"{ALERT_STATE_NODE}/{track_key}")
+        val = ref.get()
+        return val if isinstance(val, dict) else None
+    except Exception as e:
+        st.session_state['firebase_last_error'] = f"get alert state: {e}"
+        st.session_state['firebase_last_error_time'] = int(time.time())
+        return None
+
+
+def set_remote_alert_state(track_key: str, state: dict):
+    """Write per-track alert state to Firebase."""
+    if not FIREBASE_AVAILABLE:
+        return False
+    try:
+        db.reference(f"{ALERT_STATE_NODE}/{track_key}").set(state)
+        return True
+    except Exception as e:
+        st.session_state['firebase_last_error'] = f"set alert state: {e}"
+        st.session_state['firebase_last_error_time'] = int(time.time())
+        return False
 
 
 def match_detection_to_track(rect, tracked_objects, max_distance=ALERT_MATCH_DISTANCE):
@@ -267,37 +521,59 @@ def match_detection_to_track(rect, tracked_objects, max_distance=ALERT_MATCH_DIS
 
 def update_drowning_alert_state(drown_detections, tracked_objects):
     now = time.time()
-    alert_state = st.session_state.setdefault("drown_alert_state", {})
-
     for detection in drown_detections:
         track_key = str(match_detection_to_track(detection["rect"], tracked_objects))
-        state = alert_state.get(track_key)
-        if state is None:
+        # Always read per-track state from Firebase (source of truth)
+        state = get_remote_alert_state(track_key)
+        if state is None or not isinstance(state, dict):
             state = {
                 "first_seen": now,
                 "last_seen": now,
                 "minor_sent": False,
                 "major_sent": False,
             }
-            alert_state[track_key] = state
 
-        state["last_seen"] = now
-        elapsed = now - state["first_seen"]
+        # update last_seen and compute elapsed from first_seen
+        try:
+            state['last_seen'] = now
+            first = float(state.get('first_seen', now))
+        except Exception:
+            first = now
+            state['first_seen'] = now
 
-        if not state["minor_sent"]:
+        elapsed = now - first
+
+        if not state.get('minor_sent', False):
             send_camera_alert("Minor", detection["confidence"])
-            state["minor_sent"] = True
+            state['minor_sent'] = True
 
-        if elapsed >= ALERT_MAJOR_AFTER_SECONDS and not state["major_sent"]:
+        if elapsed >= ALERT_MAJOR_AFTER_SECONDS and not state.get('major_sent', False):
             send_camera_alert("Major", detection["confidence"])
-            state["major_sent"] = True
+            state['major_sent'] = True
 
-    stale_keys = [
-        key for key, state in alert_state.items()
-        if now - state.get("last_seen", now) > 20
-    ]
-    for key in stale_keys:
-        alert_state.pop(key, None)
+        # persist updated state back to Firebase
+        try:
+            set_remote_alert_state(track_key, state)
+        except Exception:
+            pass
+
+    # Prune stale remote alert states older than 20 seconds
+    try:
+        if FIREBASE_AVAILABLE:
+            snap = db.reference(ALERT_STATE_NODE).get()
+            if isinstance(snap, dict):
+                for key, state in snap.items():
+                    try:
+                        last = float(state.get('last_seen', now))
+                    except Exception:
+                        last = now
+                    if now - last > 20:
+                        try:
+                            db.reference(f"{ALERT_STATE_NODE}/{key}").delete()
+                        except Exception:
+                            pass
+    except Exception:
+        pass
 
 
 def stream_process_video(model, input_path, conf=0.4, frame_skip=1, placeholder=None):
@@ -419,6 +695,9 @@ def stream_process_video(model, input_path, conf=0.4, frame_skip=1, placeholder=
     processed = int(st.session_state.get('live_processed', 0))
     start = time.time()
 
+    # last time we polled Firebase for updates
+    last_alert_check = 0
+
     looping_file = False
     if isinstance(input_path, Path) and input_path.exists() and input_path.suffix.lower() in ['.mp4', '.mov', '.mkv']:
         looping_file = True
@@ -504,7 +783,12 @@ def stream_process_video(model, input_path, conf=0.4, frame_skip=1, placeholder=
 
                         rects.append((x1, y1, x2, y2))
 
-                        if is_drown:
+                        # Only treat as drowning detection for alerts when confidence meets threshold
+                        try:
+                            threshold = float(st.session_state.get('drown_conf_threshold', 0.6))
+                        except Exception:
+                            threshold = 0.6
+                        if is_drown and confscore >= threshold:
                             drown_detections.append({"rect": (x1, y1, x2, y2), "confidence": confscore})
 
                         # Decide whether to draw based on toggles
@@ -526,6 +810,19 @@ def stream_process_video(model, input_path, conf=0.4, frame_skip=1, placeholder=
         objects = tracker.update(rects)
         if drown_detections:
             update_drowning_alert_state(drown_detections, objects)
+
+        # Periodically poll Firebase for live updates (counts and last alert)
+        try:
+                if ensure_firebase_initialized() and (time.time() - last_alert_check) >= ALERT_POLL_INTERVAL:
+                    try:
+                        _ = fetch_remote_alert_summary()
+                    except Exception:
+                        pass
+                last_alert_check = time.time()
+        except Exception as e:
+            st.session_state['firebase_last_error'] = f"polling loop: {e}"
+            st.session_state['firebase_last_error_time'] = int(time.time())
+            st.session_state['firebase_connected'] = False
         # Do not draw tracker IDs on the UI; only red bounding boxes are shown
 
         # Encode the original BGR frame as JPEG bytes for a stable UI update.
@@ -660,7 +957,11 @@ def process_one_frame_and_continue(model, input_path):
                     # Respect show toggles from sidebar
                     show_blue = st.session_state.get('show_blue', True)
                     show_red = st.session_state.get('show_red', True)
-                    if is_drown:
+                    try:
+                        threshold = float(st.session_state.get('drown_conf_threshold', 0.6))
+                    except Exception:
+                        threshold = 0.6
+                    if is_drown and confscore >= threshold:
                         drown_detections.append({"rect": (x1, y1, x2, y2), "confidence": confscore})
 
                     if is_drown and show_red:
@@ -701,15 +1002,38 @@ def main():
     frame_skip = st.sidebar.number_input("Process every Nth frame (1 = every frame)", min_value=1, max_value=30, value=int(st.session_state.get('frame_skip', 5)), key='frame_skip')
     show_blue = st.sidebar.checkbox("Show safe (blue) boxes", value=bool(st.session_state.get('show_blue', True)), key='show_blue')
     show_red = st.sidebar.checkbox("Show drowning (red) boxes", value=bool(st.session_state.get('show_red', True)), key='show_red')
+    drown_conf_threshold = st.sidebar.slider("Drowning alert threshold", 0.0, 1.0, float(st.session_state.get('drown_conf_threshold', 0.6)), 0.01, key='drown_conf_threshold')
+
+    # Camera selection: CAM1 -> local PoolCam.mp4, CAM2 -> Tapo live stream
+    cam_choice = st.sidebar.radio("Camera", ["CAM1 - PoolCam.mp4", "CAM2 - Tapo stream"], index=1)
+    if cam_choice.startswith('CAM1'):
+        session_cam_number = 1
+        source_path = POOLCAM_PATH
+        if not source_path.exists():
+            st.sidebar.warning(f"Pool cam file not found: {source_path}")
+    else:
+        session_cam_number = 2
+        source_path = TAPO_STREAM_URL
+
+    st.session_state['camera_number'] = session_cam_number
+
+    # Alerts UI removed from sidebar
+    # (Firebase status display removed from sidebar)
 
     model = load_model(model_path if model_path else None)
     if model is None:
         return
 
-    # Start live streaming
+    # Start live streaming using selected source
     placeholder = st.empty()
     try:
-        processed, elapsed = stream_process_video(model, TAPO_STREAM_URL, conf=st.session_state.get('confidence', 0.4), frame_skip=st.session_state.get('frame_skip', 5), placeholder=placeholder)
+        processed, elapsed = stream_process_video(
+            model,
+            source_path,
+            conf=st.session_state.get('confidence', 0.4),
+            frame_skip=st.session_state.get('frame_skip', 5),
+            placeholder=placeholder,
+        )
     except Exception as e:
         st.error(f"Error during live playback: {e}")
 
