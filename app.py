@@ -112,7 +112,7 @@ if HAS_TORCH:
 load_dotenv(str(BASE_DIR / '.env'))
 
 # Camera / stream URLs can be provided via .env
-TAPO_STREAM_URL = os.environ.get('TAPO_STREAM_URL', 'rtsp://AquaGuard:AQGuardCam@192.168.68.53:554/stream1')
+TAPO_STREAM_URL = os.environ.get('TAPO_STREAM_URL', 'rtsp://aquaguard:aquaguard@%@192.168.254.115:554/stream1')
 POOLCAM_PATH = Path(os.environ.get('POOLCAM_PATH', str(BASE_DIR / 'PoolCam.mp4')))
 
 # Light/demo mode: when STREAMLIT_LIGHT_MODE env var is set (or user chooses),
@@ -120,24 +120,62 @@ POOLCAM_PATH = Path(os.environ.get('POOLCAM_PATH', str(BASE_DIR / 'PoolCam.mp4')
 LIGHT_MODE = os.environ.get('STREAMLIT_LIGHT_MODE', '0') in ('1', 'true', 'True')
 
 
-# Firebase availability determined from env/service-account or default file
+# Firebase availability determined from env/service-account or default file.
+# Newer Realtime Database rules may require matching project/auth metadata in
+# addition to the service account credential, so support both a project ID and an
+# explicit override uid when provided through environment variables.
 SERVICE_ACCOUNT_PATH = os.environ.get('SERVICE_ACCOUNT_PATH')
 SERVICE_ACCOUNT_JSON_B64 = os.environ.get('SERVICE_ACCOUNT_JSON_B64')
 FIREBASE_DB_URL = os.environ.get('FIREBASE_DB_URL', 'https://aquaguard-db-default-rtdb.firebaseio.com/')
+FIREBASE_PROJECT_ID = os.environ.get('FIREBASE_PROJECT_ID') or os.environ.get('GCLOUD_PROJECT')
+FIREBASE_AUTH_UID = os.environ.get('FIREBASE_AUTH_UID') or os.environ.get('FIREBASE_DATABASE_AUTH_UID')
+
+
+def get_service_account_candidates():
+    return [
+        Path(BASE_DIR / "SERVICE_ACCOUNT.json"),
+        Path(BASE_DIR / "serviceAccountKey.json"),
+        Path(BASE_DIR / "serviceAccount.json"),
+        Path(BASE_DIR / "service_account.json"),
+    ]
+
+
+def resolve_service_account_path():
+    """Return the first valid service-account JSON path if one exists."""
+    if SERVICE_ACCOUNT_PATH and Path(SERVICE_ACCOUNT_PATH).exists():
+        return Path(SERVICE_ACCOUNT_PATH)
+    if SERVICE_ACCOUNT_JSON_B64:
+        return None
+    for candidate in get_service_account_candidates():
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def build_firebase_options():
+    """Return the Firebase Admin SDK options needed by the Aquaguard RTDB rules."""
+    options = {"databaseURL": FIREBASE_DB_URL}
+    if FIREBASE_PROJECT_ID:
+        options["projectId"] = FIREBASE_PROJECT_ID
+    if FIREBASE_AUTH_UID:
+        options["databaseAuthVariableOverride"] = {"uid": FIREBASE_AUTH_UID}
+    return options
+
 
 FIREBASE_AVAILABLE = (
     firebase_admin is not None and
     credentials is not None and
     db is not None and
-    ( (SERVICE_ACCOUNT_PATH and Path(SERVICE_ACCOUNT_PATH).exists()) or bool(SERVICE_ACCOUNT_JSON_B64) or Path(BASE_DIR / "serviceAccountKey.json").exists() )
+    (bool(SERVICE_ACCOUNT_PATH and Path(SERVICE_ACCOUNT_PATH).exists()) or bool(SERVICE_ACCOUNT_JSON_B64) or resolve_service_account_path() is not None)
 )
 
 if FIREBASE_AVAILABLE and not firebase_admin._apps:
     # select credential source: explicit path, embedded base64, or default file
     cred_path = None
     try:
-        if SERVICE_ACCOUNT_PATH and Path(SERVICE_ACCOUNT_PATH).exists():
-            cred_path = Path(SERVICE_ACCOUNT_PATH)
+        discovered = resolve_service_account_path()
+        if discovered is not None:
+            cred_path = discovered
         elif SERVICE_ACCOUNT_JSON_B64:
             # decode to a temporary file
             data = base64.b64decode(SERVICE_ACCOUNT_JSON_B64)
@@ -145,24 +183,10 @@ if FIREBASE_AVAILABLE and not firebase_admin._apps:
             tf.write(data)
             tf.flush()
             cred_path = Path(tf.name)
-        else:
-            # check common filenames in the project root for a service account
-            candidates = [
-                Path(BASE_DIR / "SERVICE_ACCOUNT.json"),
-                Path(BASE_DIR / "serviceAccountKey.json"),
-                Path(BASE_DIR / "serviceAccount.json"),
-                Path(BASE_DIR / "service_account.json"),
-            ]
-            for c in candidates:
-                if c.exists():
-                    cred_path = c
-                    break
 
         if cred_path is not None:
             cred = credentials.Certificate(str(cred_path))
-            firebase_admin.initialize_app(cred, {
-                "databaseURL": FIREBASE_DB_URL
-            })
+            firebase_admin.initialize_app(cred, build_firebase_options())
         else:
             st.session_state.setdefault('firebase_last_error', 'No service account available')
     except Exception as e:
@@ -185,32 +209,22 @@ def ensure_firebase_initialized():
     # try to initialize using available credentials (same logic as startup)
     cred_path = None
     try:
-        if SERVICE_ACCOUNT_PATH and Path(SERVICE_ACCOUNT_PATH).exists():
-            cred_path = Path(SERVICE_ACCOUNT_PATH)
+        discovered = resolve_service_account_path()
+        if discovered is not None:
+            cred_path = discovered
         elif SERVICE_ACCOUNT_JSON_B64:
             data = base64.b64decode(SERVICE_ACCOUNT_JSON_B64)
             tf = tempfile.NamedTemporaryFile(delete=False, suffix='.json')
             tf.write(data)
             tf.flush()
             cred_path = Path(tf.name)
-        else:
-            candidates = [
-                Path(BASE_DIR / "SERVICE_ACCOUNT.json"),
-                Path(BASE_DIR / "serviceAccountKey.json"),
-                Path(BASE_DIR / "serviceAccount.json"),
-                Path(BASE_DIR / "service_account.json"),
-            ]
-            for c in candidates:
-                if c.exists():
-                    cred_path = c
-                    break
 
         if cred_path is None:
             st.session_state['firebase_last_error'] = 'No service account found for init'
             return False
 
         cred = credentials.Certificate(str(cred_path))
-        firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DB_URL})
+        firebase_admin.initialize_app(cred, build_firebase_options())
         st.session_state['firebase_connected'] = True
         return True
     except Exception as e:
@@ -234,20 +248,22 @@ def load_model(model_path: str = None):
         return None
 
     if model_path is None:
-        # Try to use model.pt in repository root or provided path
-        candidate = BASE_DIR / "model.pt"
-        alt1 = BASE_DIR / "drowning_detection_master.pt"
-        alt2 = BASE_DIR / "drowning-detection-master.pt"
-        if candidate.exists():
-            model_path = str(candidate)
-        elif alt1.exists():
-            model_path = str(alt1)
-        elif alt2.exists():
-            model_path = str(alt2)
+        # Use the custom trained project model by default and fall back to other YOLO weights if needed.
+        preferred = [
+            BASE_DIR / "model.pt",
+            BASE_DIR / "yolov8n.pt",
+            BASE_DIR / "yolov8s.pt",
+            BASE_DIR / "drowning_detection_master.pt",
+            BASE_DIR / "drowning-detection-master.pt",
+        ]
+        for candidate in preferred:
+            if candidate.exists():
+                model_path = str(candidate)
+                break
         else:
             model_path = None
     if model_path is None:
-        st.error("Model file not found. Place `model.pt` in the project root or specify a path.")
+        st.error("Model file not found. Place `model.pt`, `yolov8n.pt`, `yolov8s.pt`, or another YOLO weights file in the project root or specify a path.")
         return None
     try:
         model = YOLO(model_path)
@@ -312,10 +328,46 @@ def process_video(model, input_path, output_path, conf=0.4, frame_skip=1):
 
 ALERT_NODE = "alerts"
 ALERT_GUEST_NAME = "Found at Pool 1"
+ALERT_MINOR_AFTER_SECONDS = 0
 ALERT_MAJOR_AFTER_SECONDS = 10
 ALERT_MATCH_DISTANCE = 80
 ALERT_POLL_INTERVAL = 5  # seconds between polling Firebase for live updates
 ALERT_STATE_NODE = "alertState"
+
+
+def get_drown_threshold(default=0.8):
+    """Read the current per-frame alert threshold from session state."""
+    try:
+        threshold = float(st.session_state.get('drown_conf_threshold', default))
+    except Exception:
+        threshold = default
+    return max(0.0, min(1.0, threshold))
+
+
+def reset_alert_state_for_threshold_change(new_threshold):
+    """Clear stale alert timing state the moment the threshold changes in the sidebar."""
+    try:
+        current_threshold = float(st.session_state.get('drown_conf_threshold_last', new_threshold))
+        new_value = float(new_threshold)
+    except Exception:
+        current_threshold = new_threshold
+        new_value = new_threshold
+
+    if abs(current_threshold - new_value) > 1e-6:
+        try:
+            if FIREBASE_AVAILABLE and db is not None:
+                snap = db.reference(ALERT_STATE_NODE).get()
+                if isinstance(snap, dict):
+                    for key in list(snap.keys()):
+                        try:
+                            db.reference(f"{ALERT_STATE_NODE}/{key}").delete()
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        st.session_state['alert_state_reset_at'] = time.time()
+
+    st.session_state['drown_conf_threshold_last'] = float(new_value)
 
 
 def get_next_alert_id():
@@ -521,7 +573,13 @@ def match_detection_to_track(rect, tracked_objects, max_distance=ALERT_MATCH_DIS
 
 def update_drowning_alert_state(drown_detections, tracked_objects):
     now = time.time()
+    threshold = get_drown_threshold(0.8)
+
     for detection in drown_detections:
+        confidence = float(detection.get("confidence", 0.0))
+        if confidence < threshold:
+            continue
+
         track_key = str(match_detection_to_track(detection["rect"], tracked_objects))
         # Always read per-track state from Firebase (source of truth)
         state = get_remote_alert_state(track_key)
@@ -531,7 +589,16 @@ def update_drowning_alert_state(drown_detections, tracked_objects):
                 "last_seen": now,
                 "minor_sent": False,
                 "major_sent": False,
+                "threshold": threshold,
             }
+
+        previous_threshold = state.get('threshold')
+        if previous_threshold is None or abs(float(previous_threshold) - threshold) > 1e-6:
+            state['threshold'] = threshold
+            state['first_seen'] = now
+            state['last_seen'] = now
+            state['minor_sent'] = False
+            state['major_sent'] = False
 
         # update last_seen and compute elapsed from first_seen
         try:
@@ -543,12 +610,12 @@ def update_drowning_alert_state(drown_detections, tracked_objects):
 
         elapsed = now - first
 
-        if not state.get('minor_sent', False):
-            send_camera_alert("Minor", detection["confidence"])
+        if elapsed >= ALERT_MINOR_AFTER_SECONDS and not state.get('minor_sent', False):
+            send_camera_alert("Minor", confidence)
             state['minor_sent'] = True
 
         if elapsed >= ALERT_MAJOR_AFTER_SECONDS and not state.get('major_sent', False):
-            send_camera_alert("Major", detection["confidence"])
+            send_camera_alert("Major", confidence)
             state['major_sent'] = True
 
         # persist updated state back to Firebase
@@ -783,11 +850,8 @@ def stream_process_video(model, input_path, conf=0.4, frame_skip=1, placeholder=
 
                         rects.append((x1, y1, x2, y2))
 
-                        # Only treat as drowning detection for alerts when confidence meets threshold
-                        try:
-                            threshold = float(st.session_state.get('drown_conf_threshold', 0.6))
-                        except Exception:
-                            threshold = 0.6
+                        # Read the current threshold every frame so any placement/setting change is respected.
+                        threshold = get_drown_threshold(0.8)
                         if is_drown and confscore >= threshold:
                             drown_detections.append({"rect": (x1, y1, x2, y2), "confidence": confscore})
 
@@ -954,13 +1018,10 @@ def process_one_frame_and_continue(model, input_path):
 
                     rects.append((x1, y1, x2, y2))
 
-                    # Respect show toggles from sidebar
+                    # Respect show toggles from sidebar and re-read the threshold each pass.
                     show_blue = st.session_state.get('show_blue', True)
                     show_red = st.session_state.get('show_red', True)
-                    try:
-                        threshold = float(st.session_state.get('drown_conf_threshold', 0.6))
-                    except Exception:
-                        threshold = 0.6
+                    threshold = get_drown_threshold(0.8)
                     if is_drown and confscore >= threshold:
                         drown_detections.append({"rect": (x1, y1, x2, y2), "confidence": confscore})
 
@@ -993,7 +1054,7 @@ def process_one_frame_and_continue(model, input_path):
 
 
 def main():
-    st.title("Drowning Detection Dashboard")
+    st.title("Drowning Detection Cameras")
 
     st.sidebar.header("Settings")
     model_path = st.sidebar.text_input("Model path (leave empty to use ./model.pt)", value="")
@@ -1002,10 +1063,12 @@ def main():
     frame_skip = st.sidebar.number_input("Process every Nth frame (1 = every frame)", min_value=1, max_value=30, value=int(st.session_state.get('frame_skip', 5)), key='frame_skip')
     show_blue = st.sidebar.checkbox("Show safe (blue) boxes", value=bool(st.session_state.get('show_blue', True)), key='show_blue')
     show_red = st.sidebar.checkbox("Show drowning (red) boxes", value=bool(st.session_state.get('show_red', True)), key='show_red')
-    drown_conf_threshold = st.sidebar.slider("Drowning alert threshold", 0.0, 1.0, float(st.session_state.get('drown_conf_threshold', 0.6)), 0.01, key='drown_conf_threshold')
+    drown_conf_threshold = st.sidebar.slider("Drowning alert threshold", 0.0, 1.0, float(st.session_state.get('drown_conf_threshold', 0.8)), 0.01, key='drown_conf_threshold')
+    reset_alert_state_for_threshold_change(float(st.session_state.get('drown_conf_threshold', 0.8)))
 
     # Camera selection: CAM1 -> local PoolCam.mp4, CAM2 -> Tapo live stream
-    cam_choice = st.sidebar.radio("Camera", ["CAM1 - PoolCam.mp4", "CAM2 - Tapo stream"], index=1)
+    # Default to PoolCam so the local video is shown on first load.
+    cam_choice = st.sidebar.radio("Camera", ["CAM1 - PoolCam.mp4", "CAM2 - Tapo stream"], index=0)
     if cam_choice.startswith('CAM1'):
         session_cam_number = 1
         source_path = POOLCAM_PATH
